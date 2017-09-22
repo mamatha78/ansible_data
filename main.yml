@@ -1,0 +1,121 @@
+---
+# file: roles/sky/tasks/main.yml
+- name: Create deployment group
+  group: name="{{ sky_group }}" system=yes
+
+- name: Create deployment user
+  user: name="{{ sky_user }}" createhome=no system=yes group="{{ sky_group }}"
+
+- name: Make temporary download dir
+  file: dest="/tmp/sky" state=directory mode=755 owner="{{ sky_user }}" group="{{ sky_group }}"
+
+- name: Fetch SKY tarball
+  sudo_user: "{{ sky_user }}"
+  get_url:
+    url="{{ sky_release_url }}"
+    dest="/tmp/sky/{{ sky_release }}.tgz"
+  register: new_sky_tarball
+
+- name: Create installation directory
+  file: dest="{{ sky_install_base }}" state=directory mode=755 owner="{{ sky_user }}" group="{{ sky_group }}"
+
+# In case we don't have a new tarball but its not been extracted we do an extra check.
+- name: Check for existing installation
+  stat: path="{{ sky_dist }}"
+  register: sky_dist_exists
+
+- name: Extract sky tarball
+  sudo_user: "{{ sky_user }}"
+  unarchive:
+    src="/tmp/sky/{{ sky_release }}.tgz"
+    dest="{{ sky_install_base }}/"
+    copy=no
+  register: sky_tarball_extracted
+  when: new_sky_tarball | changed or sky_dist_exists.stat.isdir is not defined
+
+- name: Rename to Version
+  command: "mv {{ sky_install_base }}/{{ sky_release }} /{{ sky_install_base }}/{{ sky_version }}"
+  when: sky_tarball_extracted | changed
+
+- name: Symlink to current
+  file:
+    src="{{ sky_dist }}"
+    dest="{{ sky_install_base }}/current"
+    state=link
+
+- name: Create required directories
+  file:
+    dest="{{ item }}"
+    state=directory
+    mode=0755
+    owner={{ sky_user }}
+    group={{ sky_group }}
+  with_items:
+    - "{{ sky_conf_dir }}"
+    - "{{ sky_libexec_dir }}"
+
+# Not all configs have been templated yet. These are all the default configs.
+- name: Copy default configs
+  sudo_user: "{{ sky_user }}"
+  command: "cp {{ sky_dist }}/etc/{{ item }} {{ sky_conf_dir }}/"
+  args:
+    creates: "{{ sky_conf_dir }}/{{ item }}"
+  with_items:
+    - basic-realm.properties
+    - digest-realm.properties
+    - email-password.txt
+    - form-realm.properties
+    - keystore-password.txt
+    - keystore.jks
+    - sky-log4j.properties
+    - sky-security.policy
+    - stagelibswhitelist.properties
+    - sky.properties
+  when: sky_conf_dir != "{{ sky_dist }}/etc"
+
+# Install templated configurations
+- name: Deploy init script
+  template: dest="/etc/init.d/{{ sky_instance }}" src=initd.j2 owner=root group=root mode=755
+  register: sky_init_updated
+  notify: "Restart {{ sky_instance }}"
+
+- name: Deploy env script
+  template:
+    dest="{{ sky_libexec_dir }}/skyd-env.sh"
+    src=skyd-env.sh.j2 owner="{{ sky_user }}"
+    group="{{ sky_group }}"
+    mode=755
+  notify: "Restart {{ sky_instance }}"
+
+- name: Deploy config template
+  sudo_user: "{{ sky_user }}"
+  template: dest="{{ sky_conf_dir }}/sky.properties" src=sky.properties.j2
+  notify: "Restart {{ sky_instance }}"
+
+- name: Install security policy
+  sudo_user: "{{ sky_user }}"
+  template: dest="{{ sky_conf_dir }}/sky-security.policy" src=sky-security.policy.j2
+  notify: "Restart {{ sky_instance }}"
+
+- name: Install JMX access control files
+  sudo_user: "{{ sky_user }}"
+  template:
+    dest="{{ sky_conf_dir }}/{{ item }}"
+    src="{{ item }}.j2"
+    owner="{{ sky_user }}"
+    group="{{ sky_group }}"
+    mode=400
+  with_items:
+    - jmxremote.access
+    - jmxremote.password
+  notify: "Restart {{ sky_instance }}"
+  when: jmx_authenticate == true
+
+- name: systemd daemon-reload
+  sudo: yes
+  command: /usr/bin/systemctl daemon-reload
+  when: ansible_distribution == 'CentOS' and ansible_distribution_major_version == '7' and sky_init_updated | changed
+
+- name: "Ensure {{ sky_instance }} is running"
+  sudo: yes
+  service: name="{{ sky_instance }}" state=started
